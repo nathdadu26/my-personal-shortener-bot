@@ -1,12 +1,13 @@
 import os
 import re
 import logging
+import asyncio
 import httpx
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from pymongo import MongoClient
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -26,7 +27,6 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Suppress noisy HTTP / library logs
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
@@ -37,18 +37,21 @@ logging.getLogger("apscheduler").setLevel(logging.WARNING)
 load_dotenv()
 
 BOT_TOKEN         = os.getenv("BOT_TOKEN")
-SHORTENER_DOMAIN  = os.getenv("SHORTENER_DOMAIN")   # e.g. example.com
+SHORTENER_DOMAIN  = os.getenv("SHORTENER_DOMAIN")
 SHORTENER_API_KEY = os.getenv("SHORTENER_API_KEY")
 MONGO_URI         = os.getenv("MONGO_URI")
 DEST_CHANNEL_ID   = int(os.getenv("DEST_CHANNEL_ID", "0"))
-HOW_TO_OPEN_URL   = os.getenv("HOW_TO_OPEN_URL")    # 👀 HOW TO OPEN button link
-JOIN_BACKUP_URL   = os.getenv("JOIN_BACKUP_URL")     # ✅ Join Backup button link
 
 # ---------------- DATABASE ----------------
 
 client    = MongoClient(MONGO_URI)
 db        = client["viralbox_db"]
 links_col = db["links"]
+
+# ---------------- QUEUE ----------------
+
+# Each item: (message, context)
+message_queue: asyncio.Queue = asyncio.Queue()
 
 # ---------------- DB ----------------
 
@@ -83,42 +86,47 @@ async def shorten_url(url: str) -> str | None:
                 log.info(f"[SHORTEN] OK → {short}")
                 return short
             else:
-                log.warning(f"[SHORTEN] Non-success response: {data}")
+                log.warning(f"[SHORTEN] Non-success: {data}")
     except Exception as e:
         log.error(f"[SHORTEN] Exception: {e}")
     return None
 
+# ---------------- QUEUE WORKER ----------------
 
-def build_caption(short_links: list[str]) -> str:
-    lines = ["📥 Download Links/👀Watch Online\n"]
+async def queue_worker():
+    """Process one message every 5 seconds."""
+    log.info("[WORKER] Queue worker started.")
+    while True:
+        message, context = await message_queue.get()
+        try:
+            await process_message(message, context)
+        except Exception as e:
+            log.error(f"[WORKER] Unhandled error: {e}")
+        finally:
+            message_queue.task_done()
 
-    for i, link in enumerate(short_links, start=1):
-        lines.append(f"Video {i}. 👉{link}")
-
-    lines.append(
-        "\n▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▰\n"
-        "🚫⛔️ Note: We Don't Leak Anything here, "
-        "We Just Collect & Share from All Over the internet\n"
-        "Thanks🔎"
-    )
-
-    return "\n".join(lines)
-
-
-def build_keyboard() -> InlineKeyboardMarkup:
-    buttons = [
-        InlineKeyboardButton("👀 HOW TO OPEN", url=HOW_TO_OPEN_URL),
-        InlineKeyboardButton("✅ Join Backup",  url=JOIN_BACKUP_URL),
-    ]
-    return InlineKeyboardMarkup([buttons])
+        # Wait 5 seconds before processing next
+        log.info("[WORKER] Waiting 5 seconds before next message...")
+        await asyncio.sleep(5)
 
 
-async def process_and_shorten(text: str, user_id: int) -> list[str] | None:
+async def process_message(message, context):
+    user_id    = message.from_user.id
+    message_id = message.message_id
+    text       = message.text or message.caption
+
+    if not text:
+        log.info(f"[PROCESS] No text. Deleting msg_id={message_id}.")
+        await message.delete()
+        return
+
     urls = extract_urls(text)
     if not urls:
-        log.info("[PROCESS] No URLs in text.")
-        return None
+        log.info(f"[PROCESS] No URLs. Deleting msg_id={message_id}.")
+        await message.delete()
+        return
 
+    # Shorten first URL found (one link per message expected)
     short_links = []
     for url in urls:
         short = await shorten_url(url)
@@ -129,12 +137,62 @@ async def process_and_shorten(text: str, user_id: int) -> list[str] | None:
             log.warning(f"[PROCESS] Could not shorten: {url}")
 
     if not short_links:
-        log.warning("[PROCESS] No URLs shortened successfully.")
-        return None
+        log.warning(f"[PROCESS] No URLs shortened. Deleting msg_id={message_id}.")
+        await message.delete()
+        return
 
-    return short_links
+    # Build simple caption — just the shortened link(s)
+    caption = "\n".join(short_links)
 
-# ---------------- COMMANDS ----------------
+    # Post to channel
+    try:
+        if message.photo:
+            log.info(f"[POST] Sending photo → channel {DEST_CHANNEL_ID}")
+            await context.bot.send_photo(
+                chat_id=DEST_CHANNEL_ID,
+                photo=message.photo[-1].file_id,
+                caption=caption
+            )
+        elif message.video:
+            log.info(f"[POST] Sending video → channel {DEST_CHANNEL_ID}")
+            await context.bot.send_video(
+                chat_id=DEST_CHANNEL_ID,
+                video=message.video.file_id,
+                caption=caption
+            )
+        elif message.document:
+            log.info(f"[POST] Sending document → channel {DEST_CHANNEL_ID}")
+            await context.bot.send_document(
+                chat_id=DEST_CHANNEL_ID,
+                document=message.document.file_id,
+                caption=caption
+            )
+        elif message.animation:
+            log.info(f"[POST] Sending animation → channel {DEST_CHANNEL_ID}")
+            await context.bot.send_animation(
+                chat_id=DEST_CHANNEL_ID,
+                animation=message.animation.file_id,
+                caption=caption
+            )
+        else:
+            log.info(f"[POST] Sending text → channel {DEST_CHANNEL_ID}")
+            await context.bot.send_message(
+                chat_id=DEST_CHANNEL_ID,
+                text=caption
+            )
+        log.info("[POST] Successfully posted to channel.")
+    except Exception as e:
+        log.error(f"[POST] Failed: {e}")
+        return  # Don't delete if post failed
+
+    # Delete original message
+    try:
+        await message.delete()
+        log.info(f"[DELETE] Deleted msg_id={message_id} from user={user_id}")
+    except Exception as e:
+        log.error(f"[DELETE] Failed to delete msg_id={message_id}: {e}")
+
+# ---------------- HANDLERS ----------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.effective_user.first_name or "User"
@@ -142,102 +200,38 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"👋 Hello *{name}*!\n\n"
         "Send me any link or media with a caption — "
-        "I'll shorten the links and post it to the channel.",
+        "I'll shorten the links and post to the channel.",
         parse_mode="Markdown"
     )
 
-# ---------------- MESSAGE HANDLER ----------------
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message:
-        log.warning("[MSG] update.message is None, skipping.")
         return
 
-    user_id    = update.effective_user.id
-    message_id = message.message_id
-    text       = message.text or message.caption
-
-    log.info(f"[MSG] Received | user={user_id} | msg_id={message_id} | text={repr(text)}")
-
-    if not text:
-        log.info(f"[MSG] No text/caption. Deleting msg_id={message_id}.")
-        await message.delete()
-        return
-
-    short_links = await process_and_shorten(text, user_id)
-
-    if not short_links:
-        log.info(f"[MSG] No links shortened. Deleting msg_id={message_id}.")
-        await message.delete()
-        return
-
-    caption  = build_caption(short_links)
-    keyboard = build_keyboard()
-
-    # ---- Post to destination channel ----
-    try:
-        if message.photo:
-            log.info(f"[POST] Sending photo → channel {DEST_CHANNEL_ID}")
-            await context.bot.send_photo(
-                chat_id=DEST_CHANNEL_ID,
-                photo=message.photo[-1].file_id,
-                caption=caption,
-                reply_markup=keyboard
-            )
-        elif message.video:
-            log.info(f"[POST] Sending video → channel {DEST_CHANNEL_ID}")
-            await context.bot.send_video(
-                chat_id=DEST_CHANNEL_ID,
-                video=message.video.file_id,
-                caption=caption,
-                reply_markup=keyboard
-            )
-        elif message.document:
-            log.info(f"[POST] Sending document → channel {DEST_CHANNEL_ID}")
-            await context.bot.send_document(
-                chat_id=DEST_CHANNEL_ID,
-                document=message.document.file_id,
-                caption=caption,
-                reply_markup=keyboard
-            )
-        elif message.animation:
-            log.info(f"[POST] Sending animation → channel {DEST_CHANNEL_ID}")
-            await context.bot.send_animation(
-                chat_id=DEST_CHANNEL_ID,
-                animation=message.animation.file_id,
-                caption=caption,
-                reply_markup=keyboard
-            )
-        else:
-            log.info(f"[POST] Sending text → channel {DEST_CHANNEL_ID}")
-            await context.bot.send_message(
-                chat_id=DEST_CHANNEL_ID,
-                text=caption,
-                reply_markup=keyboard
-            )
-
-        log.info("[POST] Successfully posted to channel.")
-
-    except Exception as e:
-        log.error(f"[POST] Failed to post to channel: {e}")
-        return  # Don't delete original if posting failed
-
-    # ---- Delete user's original message ----
-    try:
-        await message.delete()
-        log.info(f"[DELETE] Deleted msg_id={message_id} from user={user_id}")
-    except Exception as e:
-        log.error(f"[DELETE] Failed to delete msg_id={message_id}: {e}")
+    log.info(f"[QUEUE] Queued msg_id={message.message_id} | queue size={message_queue.qsize() + 1}")
+    await message_queue.put((message, context))
 
 # ---------------- MAIN ----------------
+
+async def post_init(app):
+    """Start queue worker after bot is initialized."""
+    asyncio.create_task(queue_worker())
+    log.info("[BOOT] Queue worker task created.")
+
 
 def main():
     log.info("[BOOT] Starting health check server...")
     start_health_server()
 
     log.info("[BOOT] Building Telegram app...")
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(
