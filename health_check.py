@@ -12,19 +12,20 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"OK")
 
     def log_message(self, format, *args):
-        pass  # silence HTTP logs
+        pass
 
 
 def _self_ping(port: int, interval: int = 270):
-    """Ping public URL every 4.5 min to prevent sleep."""
     time.sleep(15)
 
     public_domain = os.getenv("KOYEB_PUBLIC_DOMAIN", "").strip()
 
+    # Remove any accidental https:// or http:// prefix from env var
+    public_domain = public_domain.replace("https://", "").replace("http://", "").rstrip("/")
+
     if public_domain:
         ping_url = f"https://{public_domain}/"
     else:
-        # Fallback: localhost (works locally, not on Koyeb — set env var on Koyeb)
         ping_url = f"http://localhost:{port}/"
 
     while True:
