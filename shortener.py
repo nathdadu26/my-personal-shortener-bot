@@ -50,7 +50,6 @@ links_col = db["links"]
 
 # ---------------- QUEUE ----------------
 
-# Each item: (message, context)
 message_queue: asyncio.Queue = asyncio.Queue()
 
 # ---------------- DB ----------------
@@ -94,10 +93,16 @@ async def shorten_url(url: str) -> str | None:
 # ---------------- QUEUE WORKER ----------------
 
 async def queue_worker():
-    """Process one message every 5 seconds."""
     log.info("[WORKER] Queue worker started.")
     while True:
-        message, context = await message_queue.get()
+        try:
+            message, context = await asyncio.wait_for(message_queue.get(), timeout=1.0)
+        except asyncio.TimeoutError:
+            continue
+        except asyncio.CancelledError:
+            log.info("[WORKER] Worker cancelled, shutting down.")
+            break
+
         try:
             await process_message(message, context)
         except Exception as e:
@@ -105,9 +110,12 @@ async def queue_worker():
         finally:
             message_queue.task_done()
 
-        # Wait 5 seconds before processing next
         log.info("[WORKER] Waiting 5 seconds before next message...")
-        await asyncio.sleep(5)
+        try:
+            await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            log.info("[WORKER] Worker cancelled during sleep, shutting down.")
+            break
 
 
 async def process_message(message, context):
@@ -126,7 +134,6 @@ async def process_message(message, context):
         await message.delete()
         return
 
-    # Shorten first URL found (one link per message expected)
     short_links = []
     for url in urls:
         short = await shorten_url(url)
@@ -141,10 +148,8 @@ async def process_message(message, context):
         await message.delete()
         return
 
-    # Build simple caption — just the shortened link(s)
     caption = "\n".join(short_links)
 
-    # Post to channel
     try:
         if message.photo:
             log.info(f"[POST] Sending photo → channel {DEST_CHANNEL_ID}")
@@ -183,9 +188,8 @@ async def process_message(message, context):
         log.info("[POST] Successfully posted to channel.")
     except Exception as e:
         log.error(f"[POST] Failed: {e}")
-        return  # Don't delete if post failed
+        return
 
-    # Delete original message
     try:
         await message.delete()
         log.info(f"[DELETE] Deleted msg_id={message_id} from user={user_id}")
@@ -209,17 +213,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message:
         return
-
     log.info(f"[QUEUE] Queued msg_id={message.message_id} | queue size={message_queue.qsize() + 1}")
     await message_queue.put((message, context))
 
-# ---------------- MAIN ----------------
+# ---------------- LIFECYCLE ----------------
 
 async def post_init(app):
-    """Start queue worker after bot is initialized."""
-    asyncio.create_task(queue_worker())
+    app.bot_data["worker_task"] = asyncio.create_task(queue_worker())
     log.info("[BOOT] Queue worker task created.")
 
+
+async def post_shutdown(app):
+    task = app.bot_data.get("worker_task")
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    log.info("[BOOT] Queue worker stopped cleanly.")
+
+# ---------------- MAIN ----------------
 
 def main():
     log.info("[BOOT] Starting health check server...")
@@ -230,6 +244,7 @@ def main():
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .build()
     )
 
